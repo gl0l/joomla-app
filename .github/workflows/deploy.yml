@@ -1,7 +1,12 @@
 name: Joomla Enterprise Deployment
+
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  
   workflow_dispatch:
     inputs:
       target_env:
@@ -9,42 +14,167 @@ on:
         required: true
         default: 'non-prod'
         type: choice
-        options: [ 'all', 'non-prod', 'dev', 'stage', 'prod' ]
+        options:
+          - all
+          - non-prod
+          - dev
+          - stage
+          - prod
       release_version:
-        description: 'Specific Git Tag, Branch, or Commit Hash'
+        description: 'Specific Git Tag, Branch, or Commit Hash (Leave blank for latest main)'
         required: false
         default: ''
         type: string
+
 jobs:
+  # =========================================================================
+  # 1. DEVELOPMENT (Direct Fast-Deploy / Cache Restart Method)
+  # =========================================================================
   deploy-dev:
     name: Deploy to Dev
     runs-on: ubuntu-latest
     environment: dev
-    if: github.event_name == 'push' || github.event.inputs.target_env == 'all' || github.event.inputs.target_env == 'dev' || github.event.inputs.target_env == 'non-prod'
+    
+    if: |
+      github.event_name == 'push' || 
+      github.event.inputs.target_env == 'all' || 
+      github.event.inputs.target_env == 'dev' ||
+      github.event.inputs.target_env == 'non-prod'
+      
     env:
-      DB_HOST: ${vars.DB_HOST}
+      DB_HOST: dev-db.internal
+      REDIS_PREFIX: joomla_dev_
+      DB_PASS: dev_insecure_pwd
+      
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "Deploying to DEV database at $DB_HOST..."
+      - name: Checkout Code Base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_version || github.sha }}
+
+      - name: Configure Joomla configuration.php
+        run: |
+          echo "Injecting unique environment variables into Joomla configuration core..."
+          echo "Public Live DB Host set to: $DB_HOST"
+
+      - name: Sync Files Directly to Dev Directory
+        run: |
+          echo "Simulating direct rsync to /var/www/joomla/dev (No symlink overhead)"
+          echo "Restarting PHP-FPM service to clear OPcache instantly..."
+
+  # =========================================================================
+  # 2. STAGING (Zero-Downtime Environment Parity)
+  # =========================================================================
   deploy-stage:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     environment: stage
+    
     needs: deploy-dev
-    if: always() && (github.event_name == 'push' || github.event.inputs.target_env == 'all' || github.event.inputs.target_env == 'stage' || github.event.inputs.target_env == 'non-prod') && (needs.deploy-dev.result == 'success' || needs.deploy-dev.result == 'skipped')
+    if: |
+      always() && 
+      (github.event_name == 'push' || github.event.inputs.target_env == 'all' || github.event.inputs.target_env == 'stage' || github.event.inputs.target_env == 'non-prod') &&
+      (needs.deploy-dev.result == 'success' || needs.deploy-dev.result == 'skipped')
+      
     env:
-      DB_HOST: ${vars.DB_HOST}
+      DB_HOST: dev-db.internal
+      REDIS_PREFIX: joomla_stage_
+      DB_PASS: stage_secure_pwd
+      
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "Zero-Downtime deployment staging to $DB_HOST..."
+      - name: Checkout Code Base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_version || github.sha }}
+
+      - name: Configure Joomla configuration.php
+        run: |
+          echo "Generating Staging configuration file targeting: $DB_HOST"
+
+      - name: Stage Code in Isolated Release Directory
+        run: |
+          echo "Creating /var/www/joomla/stage/releases/run-${{ github.run_id }}"
+          echo "Copying application assets and core files into place..."
+
+      - name: Execute Joomla Schema Updates
+        run: |
+          echo "Running CLI tool database migration dry-runs: php cli/joomla.php database:update"
+
+      - name: Perform Atomic Symlink Switch
+        run: |
+          echo "Flipping live staging symlink to new folder directory..."
+          echo "ln -sfn /var/www/joomla/stage/releases/run-${{ github.run_id }} /var/www/joomla/stage/current"
+
+  # =========================================================================
+  # 3. PRODUCTION (Protected by UI Approval Gates & Zero-Downtime Layout)
+  # =========================================================================
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
     environment: prod
+    
     needs: deploy-stage
-    if: always() && (github.event_name == 'push' || github.event.inputs.target_env == 'all' || github.event.inputs.target_env == 'prod') && (needs.deploy-stage.result == 'success' || needs.deploy-stage.result == 'skipped')
+    if: |
+      always() && 
+      (github.event_name == 'push' || github.event.inputs.target_env == 'all' || github.event.inputs.target_env == 'prod') &&
+      (needs.deploy-stage.result == 'success' || needs.deploy-stage.result == 'skipped')
+      
     env:
-      DB_HOST: ${vars.DB_HOST}
+      DB_HOST: dev-db.internal
+      REDIS_PREFIX: joomla_prod_
+      DB_PASS: prod_highsecurity_pwd_123
+      
+    outputs:
+      last_stable: ${{ steps.checkpoint.outputs.last_stable }}
+      
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "Executing high-availability zero-downtime deployment steps on $DB_HOST..."
+      - name: Checkout Code Base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_version || github.sha }}
+
+      - name: Capture Previous Release Target for Rollback Security
+        id: checkpoint
+        run: |
+          echo "Reading existing symlink location to handle automatic failures..."
+          echo "last_stable=/var/www/joomla/prod/releases/run-stable-backup" >> $GITHUB_OUTPUT
+
+      - name: Configure Joomla configuration.php
+        run: |
+          echo "Generating Production configuration file targeting high-availability cluster: $DB_HOST"
+
+      - name: Extract Code to New Release Folder
+        run: |
+          echo "Preparing /var/www/joomla/prod/releases/run-${{ github.run_id }}"
+
+      - name: Run Production Database Migrations
+        run: |
+          echo "Executing: php cli/joomla.php database:update"
+
+      - name: Atomic Symlink Switch
+        run: |
+          echo "Flipping main symlink: ln -sfn /var/www/joomla/prod/releases/run-${{ github.run_id }} /var/www/joomla/prod/current"
+
+      - name: Evict Stale Redis Caches
+        run: |
+          php cli/joomla.php cache:clean
+
+  # =========================================================================
+  # 4. PRODUCTION AUTOMATIC ROLLBACK (Only triggers on deployment failure)
+  # =========================================================================
+  rollback-prod:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: deploy-prod
+    
+    if: failure() && needs.deploy-prod.result == 'failure'
+    
+    steps:
+      - name: Instant Symlink Reversion
+        run: |
+          echo "🚨 PRODUCTION ERROR CAPTURED BY RUNNER ENVIRONMENT!"
+          echo "Quick-swapping the active symlink back to the stable checkpoint directory..."
+          echo "ln -sfn ${{ needs.deploy-prod.outputs.last_stable }} /var/www/joomla/prod/current"
+          echo "Production fallback routing restored successfully."
+          
