@@ -157,7 +157,7 @@ jobs:
 
       - name: Evict Stale Redis Caches
         run: |
-          php cli/joomla.php cache:clean
+          echo "php cli/joomla.php cache:clean"
 
   # =========================================================================
   # 4. PRODUCTION AUTOMATIC ROLLBACK (Only triggers on deployment failure)
